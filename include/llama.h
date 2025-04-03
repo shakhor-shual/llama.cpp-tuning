@@ -317,6 +317,7 @@ extern "C" {
         bool use_mmap;      // use mmap if possible
         bool use_mlock;     // force system to keep model in RAM
         bool check_tensors; // validate model tensor data
+        bool parallel_tensors_loading; // параллельная загрузка тензоров для режима LLAMA_SPLIT_MODE_LAYER
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

@@ -1,0 +1,122 @@
+// diff-файл для добавления параллельной загрузки тензоров в режиме LLAMA_SPLIT_MODE_LAYER
+// Заменить блок загрузки тензоров в функции load_tensors в src/llama-model.cpp
+
+// load tensor data в функции load_tensors
+// Старый код:
+// for (auto & it : ctx_bufs) {
+//     ggml_context * ctx = it.first;
+//     auto & bufs = it.second;
+//     if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+//         return false;
+//     }
+// }
+
+// Новый код:
+if (params.split_mode == LLAMA_SPLIT_MODE_LAYER && params.parallel_tensors_loading) {
+    // Параллельная загрузка для режима LLAMA_SPLIT_MODE_LAYER
+    LLAMA_LOG_INFO("%s: starting parallel tensor loading for %zu contexts\n", __func__, ctx_bufs.size());
+    
+    std::vector<std::thread> threads;
+    std::atomic<bool> success{true};
+    std::mutex mlock_mutex; // Мьютекс для защиты доступа к mlock_mmaps
+    std::atomic<size_t> total_loaded{0};
+    
+    for (auto & it : ctx_bufs) {
+        ggml_context * ctx = it.first;
+        auto & bufs = it.second;
+        
+        threads.emplace_back([&, ctx]() {
+            // Создаем временное хранилище для mlock_mmaps каждого потока
+            llama_mlocks thread_mlock_mmaps;
+            
+            // Получаем информацию о загружаемом контексте
+            size_t context_size = 0;
+            int context_tensors = 0;
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
+                context_size += ggml_nbytes(tensor);
+                context_tensors++;
+            }
+            
+            // Логируем начало загрузки данного контекста
+            LLAMA_LOG_INFO("%s: thread loading context with %d tensors, %.2f MB\n", 
+                          __func__, context_tensors, context_size/1024.0f/1024.0f);
+            
+            // Загружаем данные
+            bool thread_success = ml.load_all_data(
+                ctx, 
+                bufs, 
+                use_mlock ? &thread_mlock_mmaps : NULL, 
+                nullptr, // Отключаем callback для прогресса в потоках
+                nullptr
+            );
+            
+            if (!thread_success) {
+                success.store(false);
+            }
+            
+            // Безопасно добавляем полученные mlock_mmaps в общий контейнер
+            if (use_mlock && !thread_mlock_mmaps.empty()) {
+                std::lock_guard<std::mutex> lock(mlock_mutex);
+                pimpl->mlock_mmaps.insert(pimpl->mlock_mmaps.end(), 
+                                         thread_mlock_mmaps.begin(), 
+                                         thread_mlock_mmaps.end());
+                thread_mlock_mmaps.clear();
+            }
+            
+            // Увеличиваем счетчик загруженных данных
+            total_loaded += context_size;
+            
+            // Логируем завершение загрузки контекста
+            LLAMA_LOG_INFO("%s: thread finished loading context with %d tensors, %.2f MB (total loaded: %.2f MB)\n", 
+                          __func__, context_tensors, context_size/1024.0f/1024.0f, 
+                          total_loaded.load()/1024.0f/1024.0f);
+        });
+    }
+    
+    // Отображаем общий прогресс, если требуется
+    if (params.progress_callback) {
+        // Обновляем прогресс периодически, показывая приближенное значение
+        while (threads.size() > 0 && std::any_of(threads.begin(), threads.end(), 
+               [](const std::thread& t) { return t.joinable(); })) {
+            float progress = (float)total_loaded.load() / size_data;
+            if (progress > 1.0f) progress = 1.0f;
+            
+            if (!params.progress_callback(progress, params.progress_callback_user_data)) {
+                // Пользователь запросил отмену
+                success.store(false);
+                break;
+            }
+            
+            // Пауза перед следующим обновлением
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    
+    // Ждем завершения всех потоков
+    for (auto & thread : threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
+    // Финальное обновление прогресса
+    if (params.progress_callback && success.load()) {
+        params.progress_callback(1.0f, params.progress_callback_user_data);
+    }
+    
+    LLAMA_LOG_INFO("%s: parallel tensor loading completed, loaded %.2f MB\n", 
+                  __func__, total_loaded.load()/1024.0f/1024.0f);
+    
+    if (!success.load()) {
+        return false;
+    }
+} else {
+    // Стандартная последовательная загрузка
+    for (auto & it : ctx_bufs) {
+        ggml_context * ctx = it.first;
+        auto & bufs = it.second;
+        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            return false;
+        }
+    }
+}
